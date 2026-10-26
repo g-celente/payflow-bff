@@ -1,0 +1,31 @@
+name: payflow-bff
+
+# The BFF in a container. The services run from their own compose files and are reached on the host
+# (merchant-service :8081, payment-service :8082, func start :7071).
+services:
+  bff:
+    image: ${BFF_IMAGE:-payflow/bff:dev}
+    build:
+      context: .
+    environment:
+      PORT: "3000"
+      MERCHANT_SERVICE_URL: ${COMPOSE_MERCHANT_SERVICE_URL:-http://host.docker.internal:8081}
+      PAYMENT_SERVICE_URL: ${COMPOSE_PAYMENT_SERVICE_URL:-http://host.docker.internal:8082}
+      FEES_FUNCTION_URL: ${COMPOSE_FEES_FUNCTION_URL:-}
+      FEES_FUNCTION_KEY: ${FEES_FUNCTION_KEY:-}
+      INTERNAL_KEY: ${INTERNAL_KEY:?Set INTERNAL_KEY in .env}
+      GATEWAY_ORIGIN_SECRET: ${GATEWAY_ORIGIN_SECRET:-}
+      ADMIN_KEY: ${ADMIN_KEY:-}
+      CORS_ORIGIN: ${CORS_ORIGIN:-}
+      UPSTREAM_TIMEOUT_MS: ${UPSTREAM_TIMEOUT_MS:-2000}
+      PROXY_TIMEOUT_MS: ${PROXY_TIMEOUT_MS:-10000}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "127.0.0.1:${BFF_PORT:-3000}:3000"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true

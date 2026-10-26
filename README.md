@@ -41,14 +41,16 @@ flowchart LR
 
 | Item | Escolha |
 |---|---|
-| Runtime / linguagem | Node.js 20, TypeScript |
-| Framework HTTP | Express 4 |
-| Validação | zod |
-| Cliente HTTP | `fetch` nativo com `AbortController` (timeout de 2 s) |
-| Documentação | OpenAPI 3 + swagger-ui-express (`/docs`) |
-| Logs | pino (JSON, `X-Correlation-Id`) |
+| Runtime / linguagem | Node.js 22 LTS, TypeScript 6 (ESM) |
+| Framework HTTP | Express 5 |
+| Validação | zod 4 (corpo, query e variáveis de ambiente) |
+| Cliente HTTP | `fetch` nativo com `AbortSignal.timeout` (2 s no painel, 10 s no proxy) |
+| Documentação | OpenAPI 3.1 + swagger-ui-express (`/docs/`) |
+| Logs | pino + pino-http (JSON, `X-Correlation-Id`, chaves mascaradas) |
 | Testes | Vitest (unitários), Supertest (API), dependency-cruiser (arquitetura) |
-| Contêiner | Dockerfile multi-stage (`node:20-alpine`, usuário não root) |
+| Qualidade | ESLint (typescript-eslint), `tsc --noEmit` |
+| Contêiner | Dockerfile multi-stage (`node:22-alpine`, usuário não root) |
+| CI | GitHub Actions: lint, typecheck, testes e build em todo push; imagem no Docker Hub em tags `v*` |
 | Registro | Docker Hub: `docker.io/<dockerhub-user>/payflow-bff:<tag>` |
 | Execução na nuvem | Azure Container Apps (`ca-payflow-bff`) atrás do Amazon API Gateway |
 
@@ -56,86 +58,156 @@ flowchart LR
 
 | Camada | Pasta | Conteúdo |
 |---|---|---|
-| Domain | `src/domain/` | Tipos `Dashboard`, `MerchantView`, `PaymentView`, regras puras de agregação |
+| Domain | `src/domain/` | Tipos `Dashboard`, `PaymentSummary`, `Fees`, `AuthenticatedMerchant`, porta `MerchantAuthenticator`, regras puras de agregação (`buildDashboard`, avisos) e erros |
 | Application | `src/features/<fatia>/handler.ts`, `ports.ts` | Caso de uso e interfaces dos clientes de que a fatia precisa |
-| API | `src/features/<fatia>/route.ts`, `src/api/` | Rotas Express, middlewares (auth, erros, correlation-id), app e swagger |
-| Infrastructure | `src/infrastructure/` | `MerchantClient`, `PaymentClient`, `FeesClient`, config/env |
+| API | `src/features/<fatia>/route.ts`, `src/api/` | Rotas Express, middlewares (auth, gateway, erros, correlation-id), app, Swagger |
+| Infrastructure | `src/infrastructure/` | `MerchantClient`, `PaymentClient`, `FeesClient`, `ServiceHttpClient`, config/env |
 
 ```text
 src/
-├── domain/
+├── domain/                 dashboard.ts, merchant.ts, context.ts, errors.ts
 ├── features/
-│   ├── aggregated-data/   GET /aggregated-data
-│   ├── merchants-proxy/   /merchants/**
-│   └── payments-proxy/    /payments/**
+│   ├── aggregated-data/    GET /aggregated-data
+│   ├── merchants-proxy/    /merchants/**
+│   └── payments-proxy/     /payments/**
 ├── infrastructure/
-│   ├── clients/
+│   ├── clients/            http.ts, merchant-client.ts, payment-client.ts, fees-client.ts
 │   └── config.ts
 ├── api/
-│   ├── app.ts
-│   ├── middlewares/
+│   ├── app.ts              composição: middlewares + rotas, recebe os clientes como portas
+│   ├── middlewares/        auth, gateway-secret, correlation-id, errors
+│   ├── docs.ts
 │   └── openapi.yaml
-└── server.ts
+└── server.ts               lê o ambiente, cria os clientes e sobe o app
 ```
 
-Regras do dependency-cruiser (testes de arquitetura): `domain` não importa nada
-de fora de `domain`; uma fatia não importa outra; `features` não importa
-`infrastructure` (recebe as portas por injeção em `api/app.ts`).
+Regras do dependency-cruiser (testes de arquitetura, rodam no `npm test`):
 
-## Endpoints previstos
+1. `domain` não importa nada de fora de `domain` (nem Express, nem APIs do Node, nem pacotes npm).
+2. Uma fatia não importa outra.
+3. `features` não importa `infrastructure`: recebe as portas por injeção em `api/app.ts`.
+4. `handler.ts` e `ports.ts` não importam framework nem pacote nenhum.
+5. `infrastructure` só implementa as portas; não usa rotas, handlers nem a camada `api`.
+6. Sem dependências circulares ou imports que não resolvem.
 
-| Método | Rota | Descrição |
-|---|---|---|
-| GET | `/aggregated-data` | Painel: lojista + resumo + últimos 5 pagamentos + taxas |
-| GET/PUT | `/merchants/me` | Dados do lojista autenticado |
-| PUT | `/merchants/me/webhook` | Configura webhook |
-| POST/GET/PUT/DELETE | `/merchants`, `/merchants/{id}` | CRUD de lojistas (administração) |
-| POST/GET | `/payments` | Cria (repassa `Idempotency-Key`) e lista |
-| GET/PATCH/DELETE | `/payments/{id}` | Detalha, altera, cancela |
-| POST | `/payments/{id}/refunds` | Estorno |
-| POST | `/payments/{id}/pix-confirmation` | Simula confirmação PIX |
-| GET | `/health` | Health check |
-| GET | `/docs` | Swagger |
+## Endpoints
 
-Exemplo de resposta de `/aggregated-data`:
+Todas as rotas passam pelo API Gateway (`<gateway>/api/...`). Autenticação:
+**lojista** = `X-Merchant-Key`; **admin** = `X-Admin-Key` (`ADMIN_KEY`; sem ela,
+a administração responde 404).
+
+| Método | Rota | Autenticação | Descrição |
+|---|---|---|---|
+| GET | `/aggregated-data` | lojista | Painel: lojista + resumo + últimos 5 pagamentos + taxas |
+| GET | `/merchants/me` | lojista | Dados do lojista autenticado |
+| PUT | `/merchants/me` | lojista | Altera nome e e-mail (o status fica como está) |
+| PUT | `/merchants/me/webhook` | lojista | Configura o webhook (sem `secret`, um é gerado e devolvido) |
+| POST | `/merchants/me/api-key` | lojista | Gera nova chave; a anterior deixa de funcionar na hora |
+| POST | `/merchants` | — | Cadastro de lojista; devolve a API key uma única vez |
+| GET | `/merchants` | admin | Lista lojistas (`status`, `page`, `size`) |
+| GET/PUT/DELETE | `/merchants/{id}` | admin | Detalha, altera (nome, e-mail, status) e remove |
+| POST | `/payments` | lojista | Cria pagamento; exige `Idempotency-Key`, repassado ao payment-service |
+| GET | `/payments` | lojista | Lista (`status`, `method`, `from`, `to`, `page`, `size`) |
+| GET/PATCH/DELETE | `/payments/{id}` | lojista | Detalha, altera descrição/metadados, cancela |
+| POST | `/payments/{id}/refunds` | lojista | Estorno total ou parcial; exige `Idempotency-Key` |
+| POST | `/payments/{id}/pix-confirmation` | lojista | Simula confirmação PIX |
+| GET | `/health` | — | Health check (fora da checagem do Gateway) |
+| GET | `/docs/` | — | Swagger (documento em `/docs/openapi.json`) |
+
+Comportamento comum:
+
+- As respostas dos serviços chegam ao frontend como vieram (status, corpo e
+  `Content-Type`, inclusive os erros em Problem Details). O `Location` é reescrito para
+  a rota do BFF (`/v1/payments/{id}` → `/payments/{id}`), e `Retry-After` e
+  `Idempotent-Replayed` são repassados.
+- O BFF responde por conta própria: 400 para formato inválido (lista os campos), 401
+  sem chave válida, 403 sem o segredo do Gateway, 404 para rota inexistente, 502 quando
+  um serviço não responde e 504 quando passa do tempo.
+- Todo pedido aos serviços leva `X-Correlation-Id` (o recebido ou um novo), devolvido
+  também na resposta.
+
+### `GET /aggregated-data`
 
 ```json
 {
   "merchant": { "id": "…", "name": "Loja Exemplo", "webhookConfigured": true },
-  "summary": { "totalAmount": 125000, "count": 42, "byStatus": { "AUTHORIZED": 30, "PENDING": 5 }, "byMethod": { "CARD": 90000, "PIX": 35000 } },
-  "recentPayments": [ { "id": "…", "amount": 1990, "method": "PIX", "status": "CONFIRMED" } ],
-  "fees": { "totalFees": 3488, "netAmount": 121512, "byMethod": [ { "method": "CARD", "rate": 0.0349, "settlement": "D+30" } ] },
+  "summary": { "currency": "BRL", "totalAmount": 125000, "count": 42,
+               "byStatus": { "AUTHORIZED": 30, "PENDING": 5 }, "byMethod": { "CARD": 90000, "PIX": 35000 } },
+  "recentPayments": [ { "id": "…", "amount": 1990, "currency": "BRL", "method": "PIX",
+                        "status": "CONFIRMED", "createdAt": "…" } ],
+  "fees": { "totalFees": 3488, "netAmount": 121512,
+            "byMethod": [ { "method": "CARD", "gross": 90000, "rate": 0.0349, "fee": 3141, "settlement": "D+30" } ] },
   "warnings": [],
-  "generatedAt": "2026-11-10T14:00:00Z"
+  "generatedAt": "2026-11-10T14:00:00.000Z"
 }
 ```
 
-As chamadas a payment-service e Function rodam em paralelo (`Promise.allSettled`).
-Uma falha vira `null` + mensagem em `warnings`; só a falha de autenticação do
-lojista interrompe a resposta.
+Resumo e últimos pagamentos são pedidos **em paralelo** ao payment-service. As taxas
+vêm **depois do resumo**, porque a Function recebe o `byMethod` dele. Uma parte que
+falha vem `null` e ganha um item em `warnings`:
+
+```json
+{ "part": "fees", "dependency": "calculate-fees", "reason": "timeout",
+  "message": "calculate-fees did not answer in 2000 ms" }
+```
+
+`reason`: `timeout`, `unreachable`, `not-configured` (sem `FEES_FUNCTION_URL`),
+`bad-response` ou `skipped` (taxas sem resumo). Só a falha de autenticação do lojista
+interrompe a resposta.
 
 ## Estado atual
 
-Repositório novo; nada implementado.
-
-- [ ] Projeto TypeScript (Express, ESLint, Vitest), Dockerfile
-- [ ] Middleware de autenticação do lojista e de `X-Correlation-Id`
-- [ ] Clientes HTTP com timeout
-- [ ] Fatia `aggregated-data` com testes unitários (clientes simulados)
-- [ ] Fatias de proxy
-- [ ] OpenAPI + swagger-ui
-- [ ] Regras dependency-cruiser executadas no `npm test`
+- [x] Projeto TypeScript (Express 5, ESLint, Vitest), Dockerfile e `compose.yaml`
+- [x] Middleware de autenticação do lojista, do Gateway e de `X-Correlation-Id`
+- [x] Clientes HTTP com timeout
+- [x] Fatia `aggregated-data` com testes unitários (clientes simulados)
+- [x] Fatias de proxy (lojistas e pagamentos) e administração com `X-Admin-Key`
+- [x] OpenAPI + swagger-ui
+- [x] Regras dependency-cruiser executadas no `npm test`
+- [x] GitHub Actions
+- [ ] Rodar ponta a ponta com os serviços e a Function locais
 - [ ] Publicar `v1` no Docker Hub e implantar no Container Apps
 - [ ] Configurar rota no API Gateway
-- [ ] GitHub Actions
 
-## Como rodar localmente (previsto)
+## Como rodar localmente
+
+Pré-requisitos: Node.js 22 (`nvm use` lê o `.nvmrc`) e, para os serviços, Docker.
 
 ```bash
+# 1. Serviços (cada um no seu repositório)
+cd ../payflow-merchant-service && docker compose up -d      # http://localhost:8081
+cd ../payflow-payment-service  && docker compose up -d      # http://localhost:8082
+
+# 2. BFF
+cd ../payflow-bff
 cp .env.example .env
 npm install
-npm run dev          # http://localhost:3000/docs
-npm test             # unitários + arquitetura
+npm run dev          # http://localhost:3000/docs/
+```
+
+Ou o BFF em contêiner (alcança os serviços pelo host): `docker compose up -d --build`.
+
+Sem a Function (`FEES_FUNCTION_URL` vazio), o painel responde com `fees: null` e um
+aviso. Com `GATEWAY_ORIGIN_SECRET` vazio, o BFF aceita requisições diretas (só em
+desenvolvimento).
+
+```bash
+B=http://localhost:3000
+curl -X POST $B/merchants -H 'Content-Type: application/json' \
+  -d '{"name":"Loja Teste","email":"loja@teste.com","document":"98765432000110"}'   # guarde o apiKey
+K=<apiKey>
+curl $B/aggregated-data -H "X-Merchant-Key: $K"
+curl -X POST $B/payments -H "X-Merchant-Key: $K" -H 'Idempotency-Key: pedido-1' \
+  -H 'Content-Type: application/json' -d '{"amount":1990,"method":"CARD","cardToken":"tok_approved"}'
+```
+
+Testes e qualidade:
+
+```bash
+npm test             # arquitetura (dependency-cruiser) + unitários e API (Vitest)
+npm run lint
+npm run typecheck
+npm run build        # dist/
 ```
 
 ### Variáveis de ambiente
@@ -145,11 +217,19 @@ npm test             # unitários + arquitetura
 | `PORT` | Padrão `3000` |
 | `MERCHANT_SERVICE_URL` | URL base do merchant-service |
 | `PAYMENT_SERVICE_URL` | URL base do payment-service |
-| `FEES_FUNCTION_URL` | URL de `calculate-fees` |
+| `FEES_FUNCTION_URL` | URL de `calculate-fees` (opcional; sem ela as taxas vêm `null` com aviso) |
 | `FEES_FUNCTION_KEY` | Function key (segredo) |
-| `INTERNAL_KEY` | `X-Internal-Key` para os microsserviços (segredo) |
-| `GATEWAY_ORIGIN_SECRET` | Cabeçalho que o API Gateway envia; requisições sem ele são recusadas (segredo) |
-| `CORS_ORIGIN` | Domínio do frontend (para desenvolvimento local) |
+| `INTERNAL_KEY` | `X-Internal-Key` dos microsserviços, 32 a 256 caracteres (segredo, obrigatória) |
+| `GATEWAY_ORIGIN_SECRET` | Cabeçalho que o API Gateway envia; requisições sem ele são recusadas (segredo; vazio = desligado) |
+| `ADMIN_KEY` | `X-Admin-Key` da administração de lojistas (segredo; vazio = desligada) |
+| `CORS_ORIGIN` | Origens do frontend, separadas por vírgula (desenvolvimento local) |
+| `UPSTREAM_TIMEOUT_MS` | Timeout do painel e da autenticação; padrão `2000` |
+| `PROXY_TIMEOUT_MS` | Timeout das rotas de proxy; padrão `10000` |
+| `LOG_LEVEL` | Padrão `info` |
+
+Os valores do `.env.example` são só para desenvolvimento local; o `INTERNAL_KEY` é o
+mesmo dos serviços. Uma variável inválida impede o start e é nomeada no erro, sem
+mostrar o valor.
 
 ## API Gateway (Amazon API Gateway REST)
 
@@ -159,9 +239,18 @@ A configuração do gateway fica documentada aqui por ser a porta de entrada des
 - Cabeçalho fixo `X-Gateway-Secret` adicionado na integração (`GATEWAY_ORIGIN_SECRET`).
 - Usage plan com API key (`x-api-key`), throttling (rate 20 req/s, burst 40) e quota diária.
 - CORS liberado só para o domínio do CloudFront do frontend.
-- Swagger do BFF exposto também em `<gateway>/api/docs`.
+- Swagger do BFF exposto também em `<gateway>/api/docs/` (os caminhos do Swagger são relativos e funcionam atrás do prefixo).
 
 ## Publicação
+
+Pelo GitHub Actions: cadastre os segredos `DOCKERHUB_USERNAME` e `DOCKERHUB_TOKEN` no
+repositório e crie uma tag:
+
+```bash
+git tag v1 && git push origin v1   # publica docker.io/<usuario>/payflow-bff:v1
+```
+
+Ou manualmente:
 
 ```bash
 docker buildx build --platform linux/amd64 \

@@ -1,0 +1,630 @@
+openapi: 3.1.0
+info:
+  title: PayFlow BFF
+  version: 1.0.0
+  description: |
+    Backend for Frontend do portal do lojista. O frontend só fala com este BFF, sempre pelo
+    Amazon API Gateway (`/api/*`). O BFF autentica o lojista no merchant-service, agrega
+    merchant-service, payment-service e a Function `calculate-fees` em `GET /aggregated-data`
+    e faz o proxy do CRUD. O `merchantId` nunca vem do frontend: é o do lojista autenticado.
+
+    Erros em Problem Details (RFC 9457). As respostas dos serviços (inclusive erros) chegam
+    como vieram; o BFF só responde 502/504 quando um serviço não responde.
+servers:
+  - url: ..
+    description: Este BFF (na nuvem, o API Gateway em /api)
+tags:
+  - name: Painel
+  - name: Conta do lojista
+  - name: Administração
+  - name: Pagamentos
+  - name: Operação
+security:
+  - gatewayApiKey: []
+    merchantKey: []
+
+paths:
+  /aggregated-data:
+    get:
+      tags: [Painel]
+      summary: Painel em um único JSON
+      description: |
+        Lojista (merchant-service) + resumo e últimos 5 pagamentos (payment-service, em paralelo)
+        + taxas (Function calculate-fees, com o `byMethod` do resumo). Uma parte que falha vem
+        `null` e ganha um item em `warnings`; só a autenticação do lojista interrompe a resposta.
+      responses:
+        '200':
+          description: Painel
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Dashboard' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '502': { $ref: '#/components/responses/DependencyFailed' }
+        '504': { $ref: '#/components/responses/DependencyFailed' }
+
+  /merchants/me:
+    get:
+      tags: [Conta do lojista]
+      summary: Dados do lojista autenticado
+      responses:
+        '200':
+          description: Lojista
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Merchant' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    put:
+      tags: [Conta do lojista]
+      summary: Altera nome e e-mail do lojista autenticado
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ProfileChange' }
+      responses:
+        '200':
+          description: Lojista alterado
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Merchant' }
+        '400': { $ref: '#/components/responses/Problem' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /merchants/me/webhook:
+    put:
+      tags: [Conta do lojista]
+      summary: Configura o webhook do lojista autenticado
+      description: Sem `secret`, o merchant-service gera um (`whsec_…`) e o devolve.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/WebhookSettings' }
+      responses:
+        '200':
+          description: Webhook configurado (com o segredo usado na assinatura HMAC)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/WebhookConfigured' }
+        '400': { $ref: '#/components/responses/Problem' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /merchants/me/api-key:
+    post:
+      tags: [Conta do lojista]
+      summary: Gera uma nova chave para o lojista autenticado
+      description: A chave atual deixa de funcionar na hora; a nova aparece só nesta resposta.
+      responses:
+        '200':
+          description: Nova chave
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  merchantId: { type: string, format: uuid }
+                  apiKey: { type: string, example: pf_9f2c… }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /merchants:
+    post:
+      tags: [Conta do lojista]
+      summary: Cadastro de lojista (público)
+      description: Devolve a API key do lojista uma única vez.
+      security:
+        - gatewayApiKey: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/NewMerchant' }
+      responses:
+        '201':
+          description: Lojista criado
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  merchant: { $ref: '#/components/schemas/Merchant' }
+                  apiKey: { type: string, example: pf_9f2c… }
+        '400': { $ref: '#/components/responses/Problem' }
+        '409': { $ref: '#/components/responses/Problem' }
+    get:
+      tags: [Administração]
+      summary: Lista lojistas
+      security:
+        - gatewayApiKey: []
+          adminKey: []
+      parameters:
+        - { name: status, in: query, schema: { type: string, enum: [ACTIVE, SUSPENDED] } }
+        - { name: page, in: query, schema: { type: integer, minimum: 0, default: 0 } }
+        - { name: size, in: query, schema: { type: integer, minimum: 1, maximum: 100, default: 20 } }
+      responses:
+        '200':
+          description: Página de lojistas
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items: { type: array, items: { $ref: '#/components/schemas/Merchant' } }
+                  page: { type: integer }
+                  size: { type: integer }
+                  totalItems: { type: integer }
+                  totalPages: { type: integer }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/Problem' }
+
+  /merchants/{id}:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+    get:
+      tags: [Administração]
+      summary: Detalha um lojista
+      security:
+        - gatewayApiKey: []
+          adminKey: []
+      responses:
+        '200':
+          description: Lojista
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Merchant' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/Problem' }
+    put:
+      tags: [Administração]
+      summary: Altera nome, e-mail e status de um lojista
+      security:
+        - gatewayApiKey: []
+          adminKey: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+                - $ref: '#/components/schemas/ProfileChange'
+                - type: object
+                  required: [status]
+                  properties:
+                    status: { type: string, enum: [ACTIVE, SUSPENDED] }
+      responses:
+        '200':
+          description: Lojista alterado
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Merchant' }
+        '400': { $ref: '#/components/responses/Problem' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/Problem' }
+    delete:
+      tags: [Administração]
+      summary: Remove um lojista
+      security:
+        - gatewayApiKey: []
+          adminKey: []
+      responses:
+        '204': { description: Removido }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/Problem' }
+
+  /payments:
+    post:
+      tags: [Pagamentos]
+      summary: Cria um pagamento CARD ou PIX
+      description: |
+        Tokens simulados: `tok_approved` (ou outro `tok_*`) aprova, `tok_declined` recusa e
+        `tok_timeout` faz o gateway não responder (504, nada é gravado). Repetir com o mesmo
+        `Idempotency-Key` devolve a resposta original (`Idempotent-Replayed: true`).
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/NewPayment' }
+      responses:
+        '201':
+          description: Pagamento criado (AUTHORIZED, DECLINED ou PENDING)
+          headers:
+            Location: { schema: { type: string, example: /payments/9f8e7d6c-5b4a-4321-8765-0fedcba98765 } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Payment' }
+        '400': { $ref: '#/components/responses/Problem' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '409': { $ref: '#/components/responses/Problem' }
+        '422': { $ref: '#/components/responses/Problem' }
+        '503': { $ref: '#/components/responses/Problem' }
+        '504': { $ref: '#/components/responses/Problem' }
+    get:
+      tags: [Pagamentos]
+      summary: Lista os pagamentos do lojista, mais recentes primeiro
+      parameters:
+        - { name: status, in: query, schema: { $ref: '#/components/schemas/PaymentStatus' } }
+        - { name: method, in: query, schema: { type: string, enum: [CARD, PIX] } }
+        - { name: from, in: query, description: Criados a partir de (ISO-8601), schema: { type: string, format: date-time } }
+        - { name: to, in: query, description: Criados antes de (ISO-8601), schema: { type: string, format: date-time } }
+        - { name: page, in: query, schema: { type: integer, minimum: 0, default: 0 } }
+        - { name: size, in: query, schema: { type: integer, minimum: 1, maximum: 100, default: 20 } }
+      responses:
+        '200':
+          description: Página de pagamentos
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items: { type: array, items: { $ref: '#/components/schemas/Payment' } }
+                  page: { type: integer }
+                  size: { type: integer }
+                  totalItems: { type: integer }
+                  totalPages: { type: integer }
+        '400': { $ref: '#/components/responses/Problem' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /payments/{id}:
+    parameters:
+      - $ref: '#/components/parameters/PaymentId'
+    get:
+      tags: [Pagamentos]
+      summary: Detalha um pagamento, com os estornos
+      responses:
+        '200':
+          description: Pagamento
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Payment' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/Problem' }
+    patch:
+      tags: [Pagamentos]
+      summary: Altera descrição e metadados (campo ausente fica como está)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                description: { type: string, maxLength: 255 }
+                metadata: { type: object, additionalProperties: { type: string } }
+      responses:
+        '200':
+          description: Pagamento alterado
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Payment' }
+        '400': { $ref: '#/components/responses/Problem' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/Problem' }
+    delete:
+      tags: [Pagamentos]
+      summary: Cancela um pagamento PENDING (o registro fica, com status CANCELED)
+      responses:
+        '200':
+          description: Pagamento cancelado
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Payment' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/Problem' }
+        '409': { $ref: '#/components/responses/Problem' }
+
+  /payments/{id}/refunds:
+    parameters:
+      - $ref: '#/components/parameters/PaymentId'
+    post:
+      tags: [Pagamentos]
+      summary: Estorno total (sem amount) ou parcial
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                amount: { type: integer, minimum: 1, description: Centavos; ausente = todo o saldo }
+                reason: { type: string, maxLength: 255 }
+      responses:
+        '201':
+          description: Pagamento com o novo estorno
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Payment' }
+        '400': { $ref: '#/components/responses/Problem' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/Problem' }
+        '409': { $ref: '#/components/responses/Problem' }
+
+  /payments/{id}/pix-confirmation:
+    parameters:
+      - $ref: '#/components/parameters/PaymentId'
+    post:
+      tags: [Pagamentos]
+      summary: Simula a confirmação do PIX pelo gateway (PENDING → CONFIRMED)
+      responses:
+        '200':
+          description: Pagamento confirmado
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Payment' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/Problem' }
+        '409': { $ref: '#/components/responses/Problem' }
+
+  /health:
+    get:
+      tags: [Operação]
+      summary: Health check (sem autenticação)
+      security: []
+      responses:
+        '200':
+          description: No ar
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: UP }
+
+components:
+  securitySchemes:
+    gatewayApiKey:
+      type: apiKey
+      in: header
+      name: x-api-key
+      description: Chave do usage plan do API Gateway (identifica o portal). Localmente não é usada.
+    merchantKey:
+      type: apiKey
+      in: header
+      name: X-Merchant-Key
+      description: Chave do lojista, validada no merchant-service a cada requisição.
+    adminKey:
+      type: apiKey
+      in: header
+      name: X-Admin-Key
+      description: Administração de lojistas (ADMIN_KEY do BFF).
+
+  parameters:
+    PaymentId:
+      name: id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: Única por tentativa de cobrança ou estorno (até 255 caracteres).
+      schema: { type: string, maxLength: 255 }
+
+  responses:
+    Problem:
+      description: Problem Details
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    Unauthorized:
+      description: Chave ausente ou inválida
+      headers:
+        WWW-Authenticate: { schema: { type: string, example: 'ApiKey header="X-Merchant-Key"' } }
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    DependencyFailed:
+      description: Um serviço não respondeu (502) ou não respondeu a tempo (504)
+      content:
+        application/problem+json:
+          schema:
+            allOf:
+              - $ref: '#/components/schemas/Problem'
+              - type: object
+                properties:
+                  dependency: { type: string, example: merchant-service }
+
+  schemas:
+    Problem:
+      type: object
+      properties:
+        type: { type: string, example: about:blank }
+        title: { type: string }
+        status: { type: integer }
+        detail: { type: string }
+
+    Dashboard:
+      type: object
+      required: [merchant, summary, recentPayments, fees, warnings, generatedAt]
+      properties:
+        merchant:
+          type: object
+          properties:
+            id: { type: string, format: uuid }
+            name: { type: string }
+            webhookConfigured: { type: boolean }
+        summary:
+          oneOf:
+            - $ref: '#/components/schemas/PaymentSummary'
+            - type: 'null'
+        recentPayments:
+          oneOf:
+            - type: array
+              maxItems: 5
+              items:
+                type: object
+                properties:
+                  id: { type: string, format: uuid }
+                  amount: { type: integer }
+                  currency: { type: string }
+                  method: { type: string, enum: [CARD, PIX] }
+                  status: { $ref: '#/components/schemas/PaymentStatus' }
+                  createdAt: { type: string, format: date-time }
+            - type: 'null'
+        fees:
+          oneOf:
+            - $ref: '#/components/schemas/Fees'
+            - type: 'null'
+        warnings:
+          type: array
+          items:
+            type: object
+            properties:
+              part: { type: string, enum: [summary, recentPayments, fees] }
+              dependency: { type: string, example: calculate-fees }
+              reason: { type: string, enum: [timeout, unreachable, not-configured, bad-response, skipped] }
+              message: { type: string }
+        generatedAt: { type: string, format: date-time }
+      example:
+        merchant: { id: 00000000-0000-0000-0000-000000000001, name: Demo Merchant, webhookConfigured: true }
+        summary:
+          currency: BRL
+          totalAmount: 125000
+          count: 42
+          byStatus: { AUTHORIZED: 30, PENDING: 5 }
+          byMethod: { CARD: 90000, PIX: 35000 }
+        recentPayments:
+          - { id: 9f8e7d6c-5b4a-4321-8765-0fedcba98765, amount: 1990, currency: BRL, method: PIX, status: CONFIRMED, createdAt: '2026-11-10T13:58:00Z' }
+        fees:
+          totalFees: 3488
+          netAmount: 121512
+          byMethod:
+            - { method: CARD, gross: 90000, rate: 0.0349, fee: 3141, settlement: D+30 }
+            - { method: PIX, gross: 35000, rate: 0.0099, fee: 347, settlement: D+0 }
+        warnings: []
+        generatedAt: '2026-11-10T14:00:00Z'
+
+    PaymentSummary:
+      type: object
+      description: count e byStatus contam todos os pagamentos; totalAmount e byMethod são o volume aprovado líquido de estornos (centavos).
+      properties:
+        currency: { type: string, example: BRL }
+        totalAmount: { type: integer }
+        count: { type: integer }
+        byStatus: { type: object, additionalProperties: { type: integer } }
+        byMethod: { type: object, additionalProperties: { type: integer } }
+
+    Fees:
+      type: object
+      properties:
+        totalFees: { type: integer }
+        netAmount: { type: integer }
+        byMethod:
+          type: array
+          items:
+            type: object
+            properties:
+              method: { type: string }
+              gross: { type: integer }
+              rate: { type: number }
+              fee: { type: integer }
+              settlement: { type: string, example: D+30 }
+
+    Merchant:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        email: { type: string, format: email }
+        document: { type: string, description: CPF (11) ou CNPJ (14 dígitos) }
+        status: { type: string, enum: [ACTIVE, SUSPENDED] }
+        webhookConfigured: { type: boolean }
+        webhook:
+          oneOf:
+            - type: object
+              properties:
+                url: { type: string }
+                events: { type: array, items: { type: string } }
+            - type: 'null'
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+
+    NewMerchant:
+      type: object
+      required: [name, email, document]
+      properties:
+        name: { type: string, example: Loja Exemplo }
+        email: { type: string, example: contato@loja.com }
+        document: { type: string, example: '12345678000190' }
+
+    ProfileChange:
+      type: object
+      required: [name, email]
+      properties:
+        name: { type: string }
+        email: { type: string }
+
+    WebhookSettings:
+      type: object
+      required: [url, events]
+      properties:
+        url: { type: string, example: https://webhook.site/… }
+        secret: { type: string, minLength: 16, description: Ausente = gerado pelo merchant-service }
+        events:
+          type: array
+          items:
+            type: string
+            enum: [payment.authorized, payment.declined, payment.pending, payment.confirmed, payment.refunded, payment.canceled]
+
+    WebhookConfigured:
+      type: object
+      properties:
+        merchantId: { type: string, format: uuid }
+        url: { type: string }
+        secret: { type: string }
+        events: { type: array, items: { type: string } }
+
+    PaymentStatus:
+      type: string
+      enum: [PENDING, AUTHORIZED, DECLINED, CONFIRMED, CANCELED, PARTIALLY_REFUNDED, REFUNDED]
+
+    NewPayment:
+      type: object
+      required: [amount, method]
+      properties:
+        amount: { type: integer, minimum: 1, description: Centavos, example: 1990 }
+        currency: { type: string, enum: [BRL], default: BRL }
+        method: { type: string, enum: [CARD, PIX] }
+        cardToken: { type: string, description: Só para CARD, example: tok_approved }
+        description: { type: string, maxLength: 255 }
+        metadata: { type: object, additionalProperties: { type: string } }
+
+    Payment:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        merchantId: { type: string, format: uuid }
+        amount: { type: integer }
+        currency: { type: string }
+        method: { type: string, enum: [CARD, PIX] }
+        status: { $ref: '#/components/schemas/PaymentStatus' }
+        refundedAmount: { type: integer }
+        card:
+          oneOf:
+            - type: object
+              properties:
+                last4: { type: string, example: '4242' }
+            - type: 'null'
+        pix:
+          oneOf:
+            - type: object
+              properties:
+                qrCode: { type: string, description: PIX copia e cola (BR Code) }
+            - type: 'null'
+        gatewayReference: { type: string }
+        description: { type: [string, 'null'] }
+        metadata: { type: object, additionalProperties: { type: string } }
+        refunds:
+          type: array
+          items:
+            type: object
+            properties:
+              id: { type: string, format: uuid }
+              amount: { type: integer }
+              reason: { type: [string, 'null'] }
+              createdAt: { type: string, format: date-time }
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
